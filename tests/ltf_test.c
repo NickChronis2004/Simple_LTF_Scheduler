@@ -10,17 +10,12 @@
 #define __NR_set_proc_info 341
 #define __NR_get_proc_info 342
 
-struct d_params {
-    int deadline;
-    int est_runtime;
-};
-
 static long set_proc_info(int deadline, int est_runtime) {
     return syscall(__NR_set_proc_info, deadline, est_runtime);
 }
 
-static long get_proc_info(struct d_params *p) {
-    return syscall(__NR_get_proc_info, p);
+static long get_proc_info(int *deadline, int *est_runtime) {
+    return syscall(__NR_get_proc_info, deadline, est_runtime);
 }
 
 int main(int argc, char **argv) {
@@ -44,17 +39,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Αν δεν δώθηκε burn_seconds, απλώς τεστάρουμε το syscall */
+    /* If no burn_seconds given, just test the syscall */
     if (burn <= 0) {
-        struct d_params p;
-        if (get_proc_info(&p) == 0) {
+        int dl, rt;
+        if (get_proc_info(&dl, &rt) == 0) {
             printf("[PID %d] get_proc_info -> deadline=%d runtime=%d\n",
-                   getpid(), p.deadline, p.est_runtime);
+                   getpid(), dl, rt);
         }
         return 0;
     }
 
-    /* CPU burn με heartbeat */
+    /* CPU burn with heartbeat */
     time_t start = time(NULL);
     time_t last  = start;
     volatile unsigned long long it = 0;
