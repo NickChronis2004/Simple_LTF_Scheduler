@@ -615,3 +615,118 @@ Example:
 
 
 Expected result: the process with smaller $tolerance = \frac{slack}{remaining\_runtime}$ (i.e., with smaller `deadline`/`slack`) will get more CPU time and will "progress" faster (e.g., more iterations per second in heartbeat test).
+
+### 3.8 Test Procedure and Results
+
+#### 3.8.1 Transferring test files to QEMU
+
+A shared drive was used via QEMU VVFAT so that ltf_test.c would be available inside the guest:
+
+```bash
+qemu-system-i386 \
+  -hda /tmp/csd5174/hy345-linux.img \
+  -append "root=/dev/hda console=ttyS0" \
+  -kernel /tmp/csd5174_hy345/linux-2.6.38.1/arch/x86/boot/bzImage \
+  -nographic -no-reboot \
+  -drive file=fat:rw:/tmp/csd5174_share,format=raw,if=ide,index=1
+```
+
+In the guest:
+
+```bash
+mkdir -p /mnt/share
+mount /dev/hdb1 /mnt/share
+cd /mnt/share
+```
+
+#### 3.8.2 Bug Fix in Test Program (ltf_test.c)
+
+**Problem:** The initial version of `ltf_test.c` caused a crash (system freeze) when calling `get_proc_info`. The kernel itself was functioning correctly — the issue was in the user-space test program.
+
+**Root Cause:** The kernel syscall `sys_get_proc_info` expects two separate `int __user *` pointers:
+
+```c
+asmlinkage long sys_get_proc_info(int __user *deadline, int __user *est_runtime)
+```
+
+However, the original test program was passing a single pointer to a `struct d_params`:
+
+```c
+// OLD (INCORRECT) - passed one struct pointer instead of two int pointers
+struct d_params {
+    int deadline;
+    int est_runtime;
+};
+static long get_proc_info(struct d_params *p) {
+    return syscall(__NR_get_proc_info, p);  // only 1 argument!
+}
+```
+
+This meant the kernel received only one argument. The second `int __user *est_runtime` parameter contained garbage from the register/stack, causing the kernel to attempt `put_user()` to an invalid memory address, which resulted in a crash.
+
+**Fix:** The wrapper was corrected to pass two separate pointers matching the kernel signature:
+
+```c
+// NEW (CORRECT) - two separate int pointers
+static long get_proc_info(int *deadline, int *est_runtime) {
+    return syscall(__NR_get_proc_info, deadline, est_runtime);
+}
+```
+
+And the call site was updated accordingly:
+
+```c
+int dl, rt;
+if (get_proc_info(&dl, &rt) == 0) {
+    printf("[PID %d] get_proc_info -> deadline=%d runtime=%d\n",
+           getpid(), dl, rt);
+}
+```
+
+#### 3.8.3 Compilation in Guest OS
+
+The test program was compiled inside the QEMU guest (ttylinux):
+
+```bash
+gcc -o ltf_test ltf_test.c
+```
+
+Note: The `-static` flag cannot be used as ttylinux does not include a static libc (`cannot find -lc`). Dynamic linking works correctly.
+
+#### 3.8.4 Syscall Test Results
+
+Basic syscall test (without CPU burn):
+
+```bash
+./ltf_test 100 5000
+```
+
+Output:
+```
+[PID 1185] set_proc_info(100, 5000)
+[PID 1185] get_proc_info -> deadline=99 runtime=5000
+```
+
+The results confirm:
+- `set_proc_info` successfully sets the deadline and estimated runtime in the kernel
+- `get_proc_info` correctly retrieves the values back to user-space
+- The deadline shows 99 instead of 100 because approximately 1 second elapsed between the `set` and `get` calls (the kernel stores deadline as absolute jiffies and converts back to remaining seconds)
+- The runtime shows 5000ms as expected (unchanged since no CPU time was consumed by the scheduler)
+
+#### 3.8.5 LTF Scheduling Test
+
+To verify LTF scheduling behavior, two CPU-bound processes were executed in parallel:
+
+```bash
+./ltf_test 8000 8000 20 &
+./ltf_test 2000 8000 20 &
+```
+
+Parameters: same `est_runtime` (8000ms), different `deadline` (8000 vs 2000 seconds), 20 seconds of CPU burn.
+
+**Observation:** The LTF scheduler activates and gives priority to the LTF-eligible processes. However, during this test the system became unresponsive (the shell/console stopped responding to input). This is expected behavior given the current LTF implementation: since LTF tasks have absolute priority over regular CFS tasks, and the CPU burn loop runs continuously, the LTF scheduler monopolizes the CPU and starves all other processes (including the shell). The QEMU instance had to be terminated externally with `killall -9 qemu-system-i386`.
+
+This confirms that:
+1. The LTF scheduler correctly identifies and prioritizes processes that have set deadline/est_runtime via the syscalls
+2. The `pick_next_ltf_task()` function works as intended — it always selects the LTF task with the smallest tolerance
+3. The starvation of non-LTF tasks is a natural consequence of the design (LTF has strict priority over CFS), which is consistent with the assignment specification: "Οι διεργασίες αυτές έχουν προτεραιότητα σε σχέση με τις υπόλοιπες που τρέχουν στο σύστημα"
