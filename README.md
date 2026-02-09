@@ -1,5 +1,4 @@
 # HY-345 Assignment 4 - Report
-## Nikos Chronis - Student ID: 5174
 
 ---
 
